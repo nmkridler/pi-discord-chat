@@ -1,6 +1,6 @@
 # pi-discord-chat
 
-A minimal [pi](https://github.com/badlogic/pi-mono) extension for chatting with a pi coding-agent session from
+A minimal [pi](https://github.com/earendil-works/pi) extension for chatting with a pi coding-agent session from
 a Discord thread.
 
 Start `pi` in a project folder as usual, run `/chat-connect` once, and a Discord thread appears — everything you
@@ -9,7 +9,7 @@ send there reaches that same pi session, and replies come back into the thread. 
 single concise, emoji-tagged status line that's edited in place while the turn runs, then replaced by the final
 reply — no big blocks per tool call.
 
-This is a deliberately stripped-down alternative to [pi-chat](https://github.com/badlogic/pi-chat): no Gondolin
+This is a deliberately stripped-down alternative to [pi-chat](https://github.com/earendil-works/pi-chat): no Gondolin
 VM sandboxing, no cross-channel memory files, no skills, Discord only, one thread per session (not one bot
 watching a channel for everyone), and configuration is a plain JSON file instead of a guided setup. Tool calls
 run directly on the host running the session — see **Security** below.

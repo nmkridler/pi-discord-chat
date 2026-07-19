@@ -1,0 +1,9 @@
+{
+	"mcpServers": {
+		"perilla-qa": {
+			"args": [],
+			"command": "/usr/bin/perilla-mcp",
+			"env": {}
+		}
+	}
+}

@@ -1,0 +1,40 @@
+{
+	"name": "pi-discord-chat",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Minimal pi extension: chat with a pi session per Discord thread",
+	"type": "module",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"chat",
+		"discord",
+		"extension"
+	],
+	"license": "Apache-2.0",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"discord.js": "^14.26.3"
+	},
+	"scripts": {
+		"check": "biome check . && tsc --noEmit",
+		"format": "biome check --write ."
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.3.5",
+		"@earendil-works/pi-coding-agent": "^0.80.10",
+		"@earendil-works/pi-tui": "^0.80.10",
+		"@types/node": "^24.5.2",
+		"typebox": "^1.1.38",
+		"typescript": "^5.9.2"
+	}
+}

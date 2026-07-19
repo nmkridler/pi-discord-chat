@@ -1,0 +1,19 @@
+{
+	"enableAllProjectMcpServers": true,
+	"enabledMcpjsonServers": ["perilla-qa"],
+	"hooks": {
+		"PreToolUse": [
+			{
+				"hooks": [
+					{
+						"blockMessage": "blocked — use mcp__perilla-qa__ask instead (find and recursive grep -r/-R aren't allowed; grep only against a single explicit file)",
+						"command": "echo \"$CLAUDE_TOOL_INPUT\" | python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check-bash.py\"",
+						"onFailure": "block",
+						"type": "command"
+					}
+				],
+				"matcher": "Bash"
+			}
+		]
+	}
+}

@@ -221,6 +221,28 @@ export default function (pi: ExtensionAPI) {
 							);
 							return;
 						}
+						if (typeof control === "object" && control.type === "model") {
+							const modelQuery = control.name.toLowerCase();
+							const models = ctx.modelRegistry.getAll();
+							const model = models.find(
+								(m) => m.id.toLowerCase() === modelQuery || `${m.provider.toLowerCase()}/${m.id.toLowerCase()}` === modelQuery,
+							);
+							if (model) {
+								const success = await pi.setModel(model);
+								if (success) {
+									await live?.sendImmediate(`✅ Model changed to \`${model.provider}/${model.id}\``);
+								} else {
+									await live?.sendImmediate(`❌ Failed to change model to \`${model.provider}/${model.id}\` (check API keys)`);
+								}
+							} else {
+								const sample = models
+									.map((m) => m.id)
+									.slice(0, 5)
+									.join(", ");
+								await live?.sendImmediate(`❌ Model not found: \`${control.name}\`\nAvailable models include: ${sample}...`);
+							}
+							return;
+						}
 						await runtime.ingestInbound(input, checkpoint);
 						await tryDispatch(ctx);
 					},

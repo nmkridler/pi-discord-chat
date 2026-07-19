@@ -121,13 +121,22 @@ export class ConversationRuntime {
 		return true;
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | { type: "model"; name: string } | undefined {
 		if (!this.isAllowedInput(input)) return undefined;
-		const command = input.text.replace(/\s+/g, " ").trim().toLowerCase();
-		if (command === "stop" || command === "/stop") return "stop";
-		if (command === "new" || command === "/new") return "new";
-		if (command === "compact" || command === "/compact") return "compact";
-		if (command === "status" || command === "/status") return "status";
+		const command = input.text.trim();
+		const lower = command.replace(/\s+/g, " ").toLowerCase();
+		if (lower === "stop" || lower === "/stop") return "stop";
+		if (lower === "new" || lower === "/new") return "new";
+		if (lower === "compact" || lower === "/compact") return "compact";
+		if (lower === "status" || lower === "/status") return "status";
+
+		if (lower.startsWith("model ") || lower.startsWith("/model ")) {
+			const parts = command.split(/\s+/);
+			if (parts.length >= 2) {
+				return { type: "model", name: parts[1] };
+			}
+		}
+
 		return undefined;
 	}
 

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, relative, resolve as resolvePath } from "node:path";
-
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -15,6 +16,7 @@ import type { ChatConfig, LiveConnection, ResolvedThread } from "./src/types.js"
 
 const CHAT_CONNECT_FLAG = "chat-connect";
 const SESSION_STATE_CUSTOM_TYPE = "pi-discord-chat-state";
+const PI_HOME_DIR = resolvePath(homedir(), ".pi");
 
 type PersistedChatState = { accountId?: string; threadId?: string };
 type AssistantSummary = { text?: string; stopReason?: string; errorMessage?: string };
@@ -55,7 +57,8 @@ Attachments from Discord are downloaded as local file paths shown in the transcr
 To send a file back to Discord, write it under your working directory, then call chat_attach with its path.
 
 Your response text is sent as the bot's reply in this thread.
-A user typing exactly "stop" aborts the current turn, "new" starts a fresh pi session bound to this same thread, "compact" compacts context, "status" reports usage/queue info.`;
+This thread has built-in controls the user can invoke directly (as Discord slash commands, or as plain text): /model <name> switches your model, /compact optionally compacts context, /new starts a fresh pi session bound to this thread, /stop aborts the current turn, /status reports usage/queue info.
+If asked to change the model, compact context, start a new session, or similar, do not try to accomplish this yourself by editing pi's configuration (e.g. anything under ~/.pi) — you do not have a tool for it and editing that config will not affect this running session anyway. Instead, tell the user to invoke the control directly (e.g. "send /model claude-sonnet-4-5").`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -183,11 +186,19 @@ export default function (pi: ExtensionAPI) {
 							}
 							return;
 						}
-						if (control === "compact") {
+						if (typeof control === "object" && control.type === "compact") {
+							const customInstructions = control.instructions;
 							const runCompact = async () => {
 								ctx.compact({
-									onComplete: () => void live?.sendImmediate("Compaction completed."),
-									onError: (error) => void live?.sendImmediate(`Compaction failed: ${error.message}`),
+									customInstructions,
+									onComplete: () => {
+										void live?.sendImmediate("Compaction completed.");
+										void tryDispatch(ctx);
+									},
+									onError: (error) => {
+										void live?.sendImmediate(`Compaction failed: ${error.message}`);
+										void tryDispatch(ctx);
+									},
 								});
 								await live?.sendImmediate("Compaction started.");
 							};
@@ -353,7 +364,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	function pathTouchesPiHome(path: string): boolean {
+		const rel = relative(PI_HOME_DIR, resolvePath(path));
+		return rel === "" || !rel.startsWith("..");
+	}
+
+	function commandTouchesPiHome(command: string): boolean {
+		return command.includes(PI_HOME_DIR) || /(~|\$HOME)\/\.pi(\/|$)/.test(command);
+	}
+
+	const PI_HOME_BLOCK_REASON =
+		"Refusing to touch pi's own configuration under ~/.pi — tell the user to use /model, /compact, /new, or /stop instead.";
+
 	pi.on("tool_call", async (event) => {
+		if (isToolCallEventType("write", event) && pathTouchesPiHome(event.input.path)) {
+			return { block: true, reason: PI_HOME_BLOCK_REASON };
+		}
+		if (isToolCallEventType("edit", event) && pathTouchesPiHome(event.input.path)) {
+			return { block: true, reason: PI_HOME_BLOCK_REASON };
+		}
+		if (isToolCallEventType("bash", event) && commandTouchesPiHome(event.input.command)) {
+			return { block: true, reason: PI_HOME_BLOCK_REASON };
+		}
 		if (!chatTurnInFlight || !live) return;
 		void live.setToolStatus(summarizeToolCall(event.toolName, event.input as Record<string, unknown>));
 	});
@@ -381,6 +413,7 @@ export default function (pi: ExtensionAPI) {
 			if (action) {
 				await action();
 				updateStatus(ctx);
+				await tryDispatch(ctx);
 				return;
 			}
 			updateStatus(ctx);

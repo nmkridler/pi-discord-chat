@@ -1,11 +1,64 @@
 import { once } from "node:events";
 
-import { Client, Events, GatewayIntentBits, type Message, Partials } from "discord.js";
+import { Client, Events, GatewayIntentBits, type Interaction, type Message, Partials } from "discord.js";
 
 import { chunkText, neutralizeMassPings } from "../chunking.js";
 import { guessMimeType, readLocalAttachment } from "../log.js";
 import type { InboundMessageInput, LiveConnection, LiveConnectionHandlers, ResolvedThread } from "../types.js";
 import { storeDownloadedAttachment } from "./attachments.js";
+
+const SLASH_COMMAND_NAMES = ["model", "compact", "new", "stop", "status"] as const;
+
+/** Discord ApplicationCommandOptionType.String */
+const OPTION_TYPE_STRING = 3;
+
+const SLASH_COMMANDS = [
+	{
+		name: "model",
+		description: "Switch the pi model for this thread",
+		options: [
+			{
+				type: OPTION_TYPE_STRING,
+				name: "name",
+				description: "Model id, e.g. claude-sonnet-4-5 or anthropic/claude-sonnet-4-5",
+				required: true,
+			},
+		],
+	},
+	{
+		name: "compact",
+		description: "Compact this thread's conversation context",
+		options: [
+			{
+				type: OPTION_TYPE_STRING,
+				name: "instructions",
+				description: "Optional focus for the summary",
+				required: false,
+			},
+		],
+	},
+	{ name: "new", description: "Start a new pi session bound to this thread" },
+	{ name: "stop", description: "Abort the current turn" },
+	{ name: "status", description: "Show model, queue, and connection status" },
+];
+
+async function resolveGuildId(client: Client<true>, thread: ResolvedThread): Promise<string | undefined> {
+	const channel = await client.channels.fetch(thread.threadId).catch(() => null);
+	if (!channel || !("guildId" in channel)) return undefined;
+	return (channel as { guildId?: string }).guildId;
+}
+
+async function registerGuildCommands(botToken: string, applicationId: string, guildId: string): Promise<void> {
+	const response = await fetch(`https://discord.com/api/v10/applications/${applicationId}/guilds/${guildId}/commands`, {
+		method: "PUT",
+		headers: { Authorization: `Bot ${botToken}`, "content-type": "application/json" },
+		body: JSON.stringify(SLASH_COMMANDS),
+	});
+	if (!response.ok) {
+		const data = (await response.json().catch(() => undefined)) as { message?: string } | undefined;
+		throw new Error(data?.message || `Discord slash-command registration failed (${response.status})`);
+	}
+}
 
 async function withReadyClient(token: string): Promise<Client<true>> {
 	const client = new Client({
@@ -165,6 +218,20 @@ export async function connectWorkerLive(
 	await catchUp(client, thread, handlers, lastCursor);
 	await handlers.onCaughtUp();
 
+	const guildId = await resolveGuildId(client, thread);
+	if (guildId) {
+		try {
+			await registerGuildCommands(botToken, thread.account.botUserId, guildId);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendThreadMessage(
+				botToken,
+				thread.threadId,
+				`⚠️ Could not register Discord slash commands (${message}). This usually means the bot was invited without the \`applications.commands\` OAuth scope — re-invite it with that scope added. Plain-text controls (\`model <name>\`, \`compact\`, \`new\`, \`stop\`, \`status\`) still work.`,
+			).catch(() => undefined);
+		}
+	}
+
 	let statusMessageId: string | undefined;
 	let statusChain: Promise<void> = Promise.resolve();
 	const queueStatusOp = (op: () => Promise<void>): Promise<void> => {
@@ -182,6 +249,41 @@ export async function connectWorkerLive(
 		}
 	};
 	client.on(Events.MessageCreate, onMessageCreate);
+
+	const onInteractionCreate = async (interaction: Interaction) => {
+		if (!interaction.isChatInputCommand()) return;
+		if (interaction.channelId !== thread.threadId) return;
+		if (!(SLASH_COMMAND_NAMES as readonly string[]).includes(interaction.commandName)) return;
+		try {
+			await interaction.reply({ content: "Got it.", ephemeral: true });
+		} catch {
+			// Best-effort ack; the real response lands as a normal thread message below.
+		}
+		let text = interaction.commandName;
+		if (interaction.commandName === "model") {
+			text = `model ${interaction.options.getString("name", true)}`;
+		} else if (interaction.commandName === "compact") {
+			const instructions = interaction.options.getString("instructions");
+			text = instructions ? `compact ${instructions}` : "compact";
+		}
+		const member = interaction.member;
+		const roleIds = member ? (Array.isArray(member.roles) ? member.roles : member.roles.cache.map((role) => role.id)) : undefined;
+		const userName = member && "displayName" in member ? member.displayName : interaction.user.username;
+		const input: InboundMessageInput = {
+			messageId: interaction.id,
+			userId: interaction.user.id,
+			userName,
+			roleIds,
+			text,
+			isBot: false,
+		};
+		try {
+			await handlers.onMessage(input);
+		} catch (error) {
+			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
+		}
+	};
+	client.on(Events.InteractionCreate, onInteractionCreate);
 
 	let disconnectFired = false;
 	const fireDisconnect = () => {
@@ -202,6 +304,7 @@ export async function connectWorkerLive(
 		thread,
 		disconnect: async () => {
 			client.off(Events.MessageCreate, onMessageCreate);
+			client.off(Events.InteractionCreate, onInteractionCreate);
 			client.destroy();
 		},
 		sendImmediate: async (text, replyToMessageId) => sendThreadMessage(botToken, thread.threadId, text, [], undefined, replyToMessageId),

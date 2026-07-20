@@ -121,20 +121,27 @@ export class ConversationRuntime {
 		return true;
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | { type: "model"; name: string } | undefined {
+	parseControlCommand(
+		input: InboundMessageInput,
+	): "stop" | "new" | "status" | { type: "model"; name: string } | { type: "compact"; instructions?: string } | undefined {
 		if (!this.isAllowedInput(input)) return undefined;
 		const command = input.text.trim();
 		const lower = command.replace(/\s+/g, " ").toLowerCase();
 		if (lower === "stop" || lower === "/stop") return "stop";
 		if (lower === "new" || lower === "/new") return "new";
-		if (lower === "compact" || lower === "/compact") return "compact";
 		if (lower === "status" || lower === "/status") return "status";
+		if (lower === "compact" || lower === "/compact") return { type: "compact" };
 
 		if (lower.startsWith("model ") || lower.startsWith("/model ")) {
 			const parts = command.split(/\s+/);
 			if (parts.length >= 2) {
 				return { type: "model", name: parts[1] };
 			}
+		}
+
+		if (lower.startsWith("compact ") || lower.startsWith("/compact ")) {
+			const instructions = command.replace(/^\/?compact\s+/i, "").trim();
+			if (instructions) return { type: "compact", instructions };
 		}
 
 		return undefined;

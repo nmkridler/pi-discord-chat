@@ -23,9 +23,11 @@ In the [Discord Developer Portal](https://discord.com/developers/applications):
    Discord bots the application ID and the bot's own user ID are the same value).
 3. **Bot** tab → **Reset Token** → copy it. This is `botToken`. Keep it secret.
 4. Still on the **Bot** tab, enable **Message Content Intent** under Privileged Gateway Intents.
-5. **OAuth2** tab → **URL Generator** → scope `bot`, permissions: View Channels, Send Messages, Attach Files,
-   Read Message History, Create Public Threads, Send Messages in Threads. Open the generated URL and invite the
-   bot to your server.
+5. **OAuth2** tab → **URL Generator** → scopes `bot` and `applications.commands`, permissions: View Channels, Send
+   Messages, Attach Files, Read Message History, Create Public Threads, Send Messages in Threads. Open the
+   generated URL and invite the bot to your server. (`applications.commands` is required for the `/model`,
+   `/compact`, `/new`, `/stop`, `/status` slash commands below — if you invited the bot before this scope existed,
+   re-run the URL generator with both scopes checked and re-authorize; no need to kick the bot first.)
 6. In Discord, enable **Developer Mode** (User Settings → Advanced) so you can right-click a channel and
    **Copy Channel ID** — that's `parentChannelId`, the channel new session threads get created in.
 
@@ -83,8 +85,22 @@ session later reuses the same thread; a brand-new session (not `--continue`/`--s
 - `/chat-connect [accountId]` — bind this session to a thread (creates one on first connect, reused after).
 - `/chat-status` / `/chat-disconnect` — status / disconnect for this session.
 
-Inside the thread, plain text controls the running turn: `stop` aborts, `new` starts a fresh pi session bound to
-the same thread, `compact` compacts context, `status` reports usage.
+Inside the thread, both Discord slash commands and plain text control the running turn:
+
+| Slash command | Plain text | Effect |
+|---|---|---|
+| `/stop` | `stop` | Abort the current turn |
+| `/new` | `new` | Start a fresh pi session bound to the same thread |
+| `/compact [instructions]` | `compact [instructions]` | Compact context, optionally focused by instructions |
+| `/status` | `status` | Report model, queue, and connection status |
+| `/model <name>` | `model <name>` | Switch the pi model for this thread |
+
+Plain text must match exactly (`model claude-sonnet-4-5`, not "switch to claude" or "/model" with no name) —
+anything else is sent to the agent as a normal chat message instead. Slash commands are more forgiving since
+Discord validates the shape for you, and avoid a mobile-client quirk where a `/`-prefixed message that doesn't
+resolve to a real slash command can silently fail to send. Slash commands are registered per-server the first
+time a thread in that server connects; if they don't show up, re-invite the bot with the `applications.commands`
+scope (see step 1 above).
 
 ## Security
 
@@ -98,4 +114,7 @@ commands as that user.
   archived/locked) can post.
 - `chat_attach` is restricted to files inside the thread's working directory, so a compromised turn can't
   exfiltrate arbitrary host files as a Discord attachment — but reads/writes/bash are not similarly restricted.
+- `write`/`edit`/`bash` are blocked from touching anything under `~/.pi` (pi's own config, sessions, and
+  credentials), so a chat turn can't rewrite the default model/provider or other global settings as a side
+  effect of a natural-language request — use `/model`, `/compact`, `/new`, `/stop` for those instead.
 - `config.json` contains a live bot token in plaintext; treat it like any other credential file.

@@ -17,8 +17,15 @@ import type { ChatConfig, LiveConnection, ResolvedThread } from "./src/types.js"
 const CHAT_CONNECT_FLAG = "chat-connect";
 const SESSION_STATE_CUSTOM_TYPE = "pi-discord-chat-state";
 const PI_HOME_DIR = resolvePath(homedir(), ".pi");
+/**
+ * How long to wait for `agent_start` after dispatching a turn before assuming
+ * pi never started it. `pi.sendUserMessage` is fire-and-forget — a rejected
+ * prompt (bad auth, no model) never reaches us, and without this backstop the
+ * bridge would sit with chatTurnInFlight stuck true and go silent forever.
+ */
+const DISPATCH_START_TIMEOUT_MS = 180_000;
 
-type PersistedChatState = { accountId?: string; threadId?: string };
+type PersistedChatState = { accountId?: string; threadId?: string; contextClearedAt?: number };
 type AssistantSummary = { text?: string; stopReason?: string; errorMessage?: string };
 
 function extractAssistantSummary(messages: unknown[]): AssistantSummary {
@@ -57,8 +64,8 @@ Attachments from Discord are downloaded as local file paths shown in the transcr
 To send a file back to Discord, write it under your working directory, then call chat_attach with its path.
 
 Your response text is sent as the bot's reply in this thread.
-This thread has built-in controls the user can invoke directly (as Discord slash commands, or as plain text): /model <name> switches your model, /compact optionally compacts context, /new starts a fresh pi session bound to this thread, /stop aborts the current turn, /status reports usage/queue info.
-If asked to change the model, compact context, start a new session, or similar, do not try to accomplish this yourself by editing pi's configuration (e.g. anything under ~/.pi) — you do not have a tool for it and editing that config will not affect this running session anyway. Instead, tell the user to invoke the control directly (e.g. "send /model claude-sonnet-4-5").`;
+This thread has built-in controls the user can invoke directly (as Discord slash commands, or as plain text): /model <name> switches your model, /compact optionally compacts context, /clear wipes the conversation context so you start fresh (/new is an alias), /stop aborts the current turn, /status reports usage/queue info.
+If asked to change the model, compact context, clear or restart the conversation, or similar, do not try to accomplish this yourself by editing pi's configuration (e.g. anything under ~/.pi) — you do not have a tool for it and editing that config will not affect this running session anyway. Instead, tell the user to invoke the control directly (e.g. "send /model claude-sonnet-4-5").`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -75,9 +82,28 @@ export default function (pi: ExtensionAPI) {
 	let queuedOutboundAttachments: string[] = [];
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let threadSystemPromptSuffix = "";
+	let lastAgentSummary: AssistantSummary | undefined;
+	let awaitingAgentStart = false;
+	let dispatchWatchdog: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * Watermark for /clear. pi has no way for an extension event handler to start a
+	 * session, so instead we hide everything older than this from the model via the
+	 * `context` hook. The session log keeps the full history; only what pi sends to
+	 * the LLM is trimmed.
+	 */
+	let contextClearedAt: number | undefined;
+
+	/**
+	 * True while pi will keep running on its own. `ctx.isIdle()` alone is not
+	 * enough: it is still false inside `agent_end` (pi may auto-retry, auto-compact
+	 * and continue), and briefly true between our dispatch and `agent_start`.
+	 */
+	function agentBusy(ctx: ExtensionContext): boolean {
+		return awaitingAgentStart || !ctx.isIdle();
+	}
 
 	function persistChatState(accountId?: string, threadId?: string): void {
-		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { accountId, threadId });
+		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { accountId, threadId, contextClearedAt });
 	}
 
 	function getPersistedChatState(ctx: ExtensionContext): PersistedChatState | undefined {
@@ -127,8 +153,50 @@ export default function (pi: ExtensionAPI) {
 		return box;
 	});
 
+	function clearDispatchWatchdog(): void {
+		if (dispatchWatchdog) {
+			clearTimeout(dispatchWatchdog);
+			dispatchWatchdog = undefined;
+		}
+	}
+
+	function armDispatchWatchdog(ctx: ExtensionContext): void {
+		clearDispatchWatchdog();
+		dispatchWatchdog = setTimeout(() => {
+			dispatchWatchdog = undefined;
+			if (!awaitingAgentStart) return;
+			// A pre-prompt auto-compaction can delay agent_start well past the timeout.
+			// Only give up once pi is genuinely doing nothing.
+			if (!ctx.isIdle()) {
+				armDispatchWatchdog(ctx);
+				return;
+			}
+			awaitingAgentStart = false;
+			void recoverStalledDispatch(ctx);
+		}, DISPATCH_START_TIMEOUT_MS);
+	}
+
+	/** Last resort: pi never started the turn we dispatched, so unwind it ourselves. */
+	async function recoverStalledDispatch(ctx: ExtensionContext): Promise<void> {
+		const message = "pi never started the turn (the prompt was rejected)";
+		pendingChatDispatch = false;
+		chatTurnInFlight = false;
+		stopTypingLoop();
+		if (runtime) await runtime.failActiveJob(message).catch(() => undefined);
+		await live?.sendImmediate(`⚠️ pi-discord-chat: ${message}`).catch(() => undefined);
+		await runPendingControlAction();
+		updateStatus(ctx, message);
+		await tryDispatch(ctx);
+	}
+
+	async function runPendingControlAction(): Promise<void> {
+		const action = pendingControlAction;
+		pendingControlAction = undefined;
+		if (action) await action();
+	}
+
 	async function tryDispatch(ctx: ExtensionContext): Promise<void> {
-		if (!runtime || chatTurnInFlight || !ctx.isIdle()) return;
+		if (!runtime || chatTurnInFlight || agentBusy(ctx)) return;
 		const next = runtime.beginNextJob();
 		if (!next) {
 			updateStatus(ctx);
@@ -139,12 +207,16 @@ export default function (pi: ExtensionAPI) {
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
 			pendingChatDispatch = true;
+			awaitingAgentStart = true;
+			armDispatchWatchdog(ctx);
 			startTypingLoop();
 			pi.sendUserMessage(next.prompt);
 			updateStatus(ctx);
 		} catch (error) {
 			pendingChatDispatch = false;
 			chatTurnInFlight = false;
+			awaitingAgentStart = false;
+			clearDispatchWatchdog();
 			stopTypingLoop();
 			const message = error instanceof Error ? error.message : String(error);
 			await runtime.failActiveJob(`dispatch failed: ${message}`);
@@ -178,11 +250,15 @@ export default function (pi: ExtensionAPI) {
 						if (!runtime) return;
 						const control = runtime.parseControlCommand(input);
 						if (control === "stop") {
-							if (chatTurnInFlight || !ctx.isIdle()) {
+							if (agentBusy(ctx)) {
 								ctx.abort();
 								await live?.sendImmediate("Aborted current turn.");
 							} else {
+								// Nothing is running: clear any stale in-flight bookkeeping so the
+								// queue can drain instead of staying wedged.
+								chatTurnInFlight = false;
 								await live?.sendImmediate("No active turn.");
+								await tryDispatch(ctx);
 							}
 							return;
 						}
@@ -202,26 +278,32 @@ export default function (pi: ExtensionAPI) {
 								});
 								await live?.sendImmediate("Compaction started.");
 							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
+							if (agentBusy(ctx)) {
 								pendingControlAction = runCompact;
 								ctx.abort();
 								await live?.sendImmediate("Aborting current turn, then compacting.");
 							} else {
+								chatTurnInFlight = false;
 								await runCompact();
 							}
 							return;
 						}
-						if (control === "new") {
-							const queueNewSession = async () => {
-								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-								await live?.sendImmediate("Starting a new pi session for this thread.");
+						if (control === "clear") {
+							const runClear = async () => {
+								// Cut only between turns: mid-turn this could orphan a toolResult
+								// whose toolUse got filtered out, which some providers reject.
+								contextClearedAt = Date.now();
+								persistChatState(boundAccountId, runtime?.thread.threadId);
+								await live?.sendImmediate("Context cleared. Starting fresh — I no longer remember this thread's earlier messages.");
 							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								pendingControlAction = queueNewSession;
+							if (agentBusy(ctx)) {
+								pendingControlAction = runClear;
 								ctx.abort();
-								await live?.sendImmediate("Aborting current turn, then starting a new pi session.");
+								await live?.sendImmediate("Aborting current turn, then clearing context.");
 							} else {
-								await queueNewSession();
+								chatTurnInFlight = false;
+								await runClear();
+								await tryDispatch(ctx);
 							}
 							return;
 						}
@@ -283,6 +365,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		boundAccountId = accountId;
 		threadSystemPromptSuffix = buildThreadSystemPrompt(thread);
+		// Carry the /clear watermark across reconnects, so a dropped gateway
+		// connection does not resurrect history the user already cleared.
+		contextClearedAt = getPersistedChatState(ctx)?.contextClearedAt ?? contextClearedAt;
 		persistChatState(accountId, threadId);
 		pi.sendMessage({ customType: "chat-context", content: `Connected to Discord thread "${thread.threadName}".`, display: true });
 		updateStatus(ctx);
@@ -315,6 +400,12 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function disconnectAll(ctx: ExtensionContext): Promise<void> {
+		clearDispatchWatchdog();
+		awaitingAgentStart = false;
+		chatTurnInFlight = false;
+		pendingChatDispatch = false;
+		pendingControlAction = undefined;
+		lastAgentSummary = undefined;
 		stopTypingLoop();
 		if (live) {
 			await live.disconnect().catch(() => undefined);
@@ -396,26 +487,48 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: event.systemPrompt + threadSystemPromptSuffix };
 	});
 
-	pi.on("agent_end", async (event, ctx) => {
+	// Implements /clear: hide pre-watermark history from the model on every LLM call.
+	// The new user message always survives the cut, so the model never sees an empty
+	// context, and pi's own token accounting drops to match what we actually send.
+	pi.on("context", async (event) => {
+		const clearedAt = contextClearedAt;
+		if (!clearedAt) return undefined;
+		const kept = event.messages.filter((message) => {
+			const timestamp = (message as { timestamp?: number }).timestamp;
+			return typeof timestamp !== "number" || timestamp >= clearedAt;
+		});
+		return { messages: kept };
+	});
+
+	pi.on("agent_start", async () => {
+		if (!awaitingAgentStart) return;
+		awaitingAgentStart = false;
+		clearDispatchWatchdog();
+	});
+
+	// agent_end can fire several times for one dispatched turn: pi may auto-retry,
+	// auto-compact on overflow and continue, or drain queued follow-ups afterwards.
+	// Only record what the run produced here; acting on it is agent_settled's job.
+	pi.on("agent_end", async (event) => {
+		lastAgentSummary = extractAssistantSummary(event.messages as unknown[]);
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		const summary = lastAgentSummary ?? {};
+		lastAgentSummary = undefined;
+		if (live) await live.clearToolStatus().catch(() => undefined);
 		if (!runtime || !chatTurnInFlight) {
 			stopTypingLoop();
+			await runPendingControlAction();
 			updateStatus(ctx);
+			await tryDispatch(ctx);
 			return;
 		}
-		const summary = extractAssistantSummary(event.messages as unknown[]);
-		if (live) await live.clearToolStatus();
 		if (summary.stopReason === "aborted") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
 			await runtime.failActiveJob("aborted");
-			const action = pendingControlAction;
-			pendingControlAction = undefined;
-			if (action) {
-				await action();
-				updateStatus(ctx);
-				await tryDispatch(ctx);
-				return;
-			}
+			await runPendingControlAction();
 			updateStatus(ctx);
 			await tryDispatch(ctx);
 			return;
@@ -423,9 +536,11 @@ export default function (pi: ExtensionAPI) {
 		if (summary.stopReason === "error" || summary.stopReason === "length") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
-			const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
+			// "length" here means pi's own compact-and-retry already failed to recover.
+			const errorMessage = summary.errorMessage || (summary.stopReason === "length" ? "ran out of context — send /compact" : "agent error");
 			await runtime.failActiveJob(errorMessage);
 			if (live) await live.sendImmediate(`⚠️ pi-discord-chat error: ${errorMessage}`).catch(() => undefined);
+			await runPendingControlAction();
 			updateStatus(ctx, errorMessage);
 			await tryDispatch(ctx);
 			return;
@@ -442,6 +557,7 @@ export default function (pi: ExtensionAPI) {
 				const message = error instanceof Error ? error.message : String(error);
 				chatTurnInFlight = false;
 				await runtime.failActiveJob(`send failed: ${message}`);
+				await runPendingControlAction();
 				updateStatus(ctx, message);
 				await tryDispatch(ctx);
 				return;
@@ -449,6 +565,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		chatTurnInFlight = false;
 		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
+		await runPendingControlAction();
 		updateStatus(ctx);
 		await tryDispatch(ctx);
 	});

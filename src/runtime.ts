@@ -123,12 +123,14 @@ export class ConversationRuntime {
 
 	parseControlCommand(
 		input: InboundMessageInput,
-	): "stop" | "new" | "status" | { type: "model"; name: string } | { type: "compact"; instructions?: string } | undefined {
+	): "stop" | "clear" | "status" | { type: "model"; name: string } | { type: "compact"; instructions?: string } | undefined {
 		if (!this.isAllowedInput(input)) return undefined;
 		const command = input.text.trim();
 		const lower = command.replace(/\s+/g, " ").toLowerCase();
 		if (lower === "stop" || lower === "/stop") return "stop";
-		if (lower === "new" || lower === "/new") return "new";
+		// "new" is kept as an alias: pi cannot start a session from an extension event
+		// handler, and clearing the context is what people mean by it anyway.
+		if (lower === "clear" || lower === "/clear" || lower === "new" || lower === "/new") return "clear";
 		if (lower === "status" || lower === "/status") return "status";
 		if (lower === "compact" || lower === "/compact") return { type: "compact" };
 

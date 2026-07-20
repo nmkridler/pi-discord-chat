@@ -7,7 +7,7 @@ import { guessMimeType, readLocalAttachment } from "../log.js";
 import type { InboundMessageInput, LiveConnection, LiveConnectionHandlers, ResolvedThread } from "../types.js";
 import { storeDownloadedAttachment } from "./attachments.js";
 
-const SLASH_COMMAND_NAMES = ["model", "compact", "new", "stop", "status"] as const;
+const SLASH_COMMAND_NAMES = ["model", "compact", "clear", "stop", "status"] as const;
 
 /** Discord ApplicationCommandOptionType.String */
 const OPTION_TYPE_STRING = 3;
@@ -37,7 +37,7 @@ const SLASH_COMMANDS = [
 			},
 		],
 	},
-	{ name: "new", description: "Start a new pi session bound to this thread" },
+	{ name: "clear", description: "Clear this thread's conversation context and start fresh" },
 	{ name: "stop", description: "Abort the current turn" },
 	{ name: "status", description: "Show model, queue, and connection status" },
 ];

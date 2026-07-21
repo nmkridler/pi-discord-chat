@@ -249,14 +249,22 @@ export default function (pi: ExtensionAPI) {
 					onMessage: async (input, checkpoint) => {
 						if (!runtime) return;
 						const control = runtime.parseControlCommand(input);
+						// Control messages skip ingestInbound, so checkpoint them here —
+						// otherwise the resume cursor never moves past them and every
+						// reconnect's catch-up fetch replays (re-executes) them.
+						if (control && checkpoint) await runtime.noteCheckpoint(checkpoint);
 						if (control === "stop") {
 							if (agentBusy(ctx)) {
 								ctx.abort();
 								await live?.sendImmediate("Aborted current turn.");
 							} else {
 								// Nothing is running: clear any stale in-flight bookkeeping so the
-								// queue can drain instead of staying wedged.
+								// queue can drain instead of staying wedged. chatTurnInFlight and the
+								// runtime's active job are set together in tryDispatch, so a stale
+								// flag means a stale active job too — beginNextJob() stays blocked
+								// until it is resolved (failActiveJob is a no-op when none is active).
 								chatTurnInFlight = false;
+								await runtime.failActiveJob("stopped while idle");
 								await live?.sendImmediate("No active turn.");
 								await tryDispatch(ctx);
 							}

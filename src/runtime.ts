@@ -101,10 +101,19 @@ export class ConversationRuntime {
 		await appendThreadRecord(this.thread, record);
 	}
 
-	private getLastCompletedTriggerRecordId(): number {
+	/**
+	 * Boundary for buildPrompt: trigger messages at or before this record id are
+	 * already accounted for and must not be replayed into the next prompt. A
+	 * failed/aborted job resolves its trigger message just as much as a completed
+	 * one does -- /stop is the user saying "abandon that request", not "hold it
+	 * for later" -- so both record types advance the boundary. Counting only
+	 * job_completed left an aborted turn's trigger message sitting after the
+	 * boundary forever, so it got bundled into every prompt from then on.
+	 */
+	private getLastResolvedTriggerRecordId(): number {
 		let last = 0;
 		for (const record of this.records) {
-			if (record.type !== "job_completed") continue;
+			if (record.type !== "job_completed" && record.type !== "job_failed") continue;
 			last = Math.max(last, record.triggerRecordId);
 		}
 		return last;
@@ -217,9 +226,9 @@ export class ConversationRuntime {
 	}
 
 	private buildPrompt(job: PendingJob): string {
-		const completedBoundary = this.getLastCompletedTriggerRecordId();
+		const resolvedBoundary = this.getLastResolvedTriggerRecordId();
 		const slice = this.records.filter(
-			(record) => record.recordId > completedBoundary && record.recordId <= job.triggerRecordId && record.type === "inbound",
+			(record) => record.recordId > resolvedBoundary && record.recordId <= job.triggerRecordId && record.type === "inbound",
 		);
 		const lines: string[] = [];
 		for (const record of slice) lines.push(...formatTranscriptRecord(record));

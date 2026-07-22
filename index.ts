@@ -8,6 +8,7 @@ import { Type } from "typebox";
 
 import { CHAT_CONFIG_PATH, loadChatConfig, resolveThread } from "./src/config.js";
 import { createThread } from "./src/discord/client.js";
+import { installGatewayCrashGuard } from "./src/discord/crash-guard.js";
 import { connectWorkerLive } from "./src/discord/live.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { summarizeToolCall } from "./src/tool-status.js";
@@ -70,6 +71,11 @@ If asked to change the model, compact context, clear or restart the conversation
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag(CHAT_CONNECT_FLAG, { description: "Auto-connect pi-discord-chat to this account on startup", type: "string" });
+
+	// A transient Discord gateway handshake timeout can surface as an uncaught
+	// raw-socket error (see crash-guard.ts) and take down the whole pi process.
+	// The shard reconnects on its own, so swallow that class and let it self-heal.
+	installGatewayCrashGuard((message) => console.error(`[pi-discord-chat] ${message}`));
 
 	const ownerId = `pi-discord-chat-${process.pid}-${randomUUID()}`;
 	let runtime: ConversationRuntime | undefined;

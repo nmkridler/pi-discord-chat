@@ -208,6 +208,11 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 			return;
 		}
+		if (!next.prompt.trim()) {
+			await runtime.failActiveJob("empty prompt");
+			await tryDispatch(ctx);
+			return;
+		}
 		try {
 			chatTurnInFlight = true;
 			activeTriggerMessageId = next.triggerMessageId;
@@ -253,105 +258,108 @@ export default function (pi: ExtensionAPI) {
 				thread,
 				{
 					onMessage: async (input, checkpoint) => {
-						if (!runtime) return;
-						const control = runtime.parseControlCommand(input);
-						// Control messages skip ingestInbound, so checkpoint them here —
-						// otherwise the resume cursor never moves past them and every
-						// reconnect's catch-up fetch replays (re-executes) them.
-						if (control && checkpoint) await runtime.noteCheckpoint(checkpoint);
-						if (control === "stop") {
-							if (agentBusy(ctx)) {
-								ctx.abort();
-								await live?.sendImmediate("Aborted current turn.");
-							} else {
-								// Nothing is running: clear any stale in-flight bookkeeping so the
-								// queue can drain instead of staying wedged. chatTurnInFlight and the
-								// runtime's active job are set together in tryDispatch, so a stale
-								// flag means a stale active job too — beginNextJob() stays blocked
-								// until it is resolved (failActiveJob is a no-op when none is active).
-								chatTurnInFlight = false;
-								await runtime.failActiveJob("stopped while idle");
-								await live?.sendImmediate("No active turn.");
-								await tryDispatch(ctx);
-							}
-							return;
-						}
-						if (typeof control === "object" && control.type === "compact") {
-							const customInstructions = control.instructions;
-							const runCompact = async () => {
-								ctx.compact({
-									customInstructions,
-									onComplete: () => {
-										void live?.sendImmediate("Compaction completed.");
-										void tryDispatch(ctx);
-									},
-									onError: (error) => {
-										void live?.sendImmediate(`Compaction failed: ${error.message}`);
-										void tryDispatch(ctx);
-									},
-								});
-								await live?.sendImmediate("Compaction started.");
-							};
-							if (agentBusy(ctx)) {
-								pendingControlAction = runCompact;
-								ctx.abort();
-								await live?.sendImmediate("Aborting current turn, then compacting.");
-							} else {
-								chatTurnInFlight = false;
-								await runCompact();
-							}
-							return;
-						}
-						if (control === "clear") {
-							const runClear = async () => {
-								// Cut only between turns: mid-turn this could orphan a toolResult
-								// whose toolUse got filtered out, which some providers reject.
-								contextClearedAt = Date.now();
-								persistChatState(boundAccountId, runtime?.thread.threadId);
-								await live?.sendImmediate("Context cleared. Starting fresh — I no longer remember this thread's earlier messages.");
-							};
-							if (agentBusy(ctx)) {
-								pendingControlAction = runClear;
-								ctx.abort();
-								await live?.sendImmediate("Aborting current turn, then clearing context.");
-							} else {
-								chatTurnInFlight = false;
-								await runClear();
-								await tryDispatch(ctx);
-							}
-							return;
-						}
-						if (control === "status") {
-							const status = runtime.getStatus();
-							await live?.sendImmediate(
-								`Model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "?"}\nQueue: ${status.queueLength}${status.hasActiveJob ? " (active)" : ""}`,
-							);
-							return;
-						}
-						if (typeof control === "object" && control.type === "model") {
-							const modelQuery = control.name.toLowerCase();
-							const models = ctx.modelRegistry.getAll();
-							const model = models.find(
-								(m) => m.id.toLowerCase() === modelQuery || `${m.provider.toLowerCase()}/${m.id.toLowerCase()}` === modelQuery,
-							);
-							if (model) {
-								const success = await pi.setModel(model);
-								if (success) {
-									await live?.sendImmediate(`✅ Model changed to \`${model.provider}/${model.id}\``);
+						const currentRuntime = runtime;
+						if (!currentRuntime) return;
+						await currentRuntime.enqueueIngress(async () => {
+							const control = currentRuntime.parseControlCommand(input);
+							// Control messages skip ingestInbound, so checkpoint them here —
+							// otherwise the resume cursor never moves past them and every
+							// reconnect's catch-up fetch replays (re-executes) them.
+							if (control && checkpoint) await currentRuntime.noteCheckpoint(checkpoint);
+							if (control === "stop") {
+								if (agentBusy(ctx)) {
+									ctx.abort();
+									await live?.sendImmediate("Aborted current turn.");
 								} else {
-									await live?.sendImmediate(`❌ Failed to change model to \`${model.provider}/${model.id}\` (check API keys)`);
+									// Nothing is running: clear any stale in-flight bookkeeping so the
+									// queue can drain instead of staying wedged. chatTurnInFlight and the
+									// runtime's active job are set together in tryDispatch, so a stale
+									// flag means a stale active job too — beginNextJob() stays blocked
+									// until it is resolved (failActiveJob is a no-op when none is active).
+									chatTurnInFlight = false;
+									await currentRuntime.failActiveJob("stopped while idle");
+									await live?.sendImmediate("No active turn.");
+									await tryDispatch(ctx);
 								}
-							} else {
-								const sample = models
-									.map((m) => m.id)
-									.slice(0, 5)
-									.join(", ");
-								await live?.sendImmediate(`❌ Model not found: \`${control.name}\`\nAvailable models include: ${sample}...`);
+								return;
 							}
-							return;
-						}
-						await runtime.ingestInbound(input, checkpoint);
-						await tryDispatch(ctx);
+							if (typeof control === "object" && control.type === "compact") {
+								const customInstructions = control.instructions;
+								const runCompact = async () => {
+									ctx.compact({
+										customInstructions,
+										onComplete: () => {
+											void live?.sendImmediate("Compaction completed.");
+											void tryDispatch(ctx);
+										},
+										onError: (error) => {
+											void live?.sendImmediate(`Compaction failed: ${error.message}`);
+											void tryDispatch(ctx);
+										},
+									});
+									await live?.sendImmediate("Compaction started.");
+								};
+								if (agentBusy(ctx)) {
+									pendingControlAction = runCompact;
+									ctx.abort();
+									await live?.sendImmediate("Aborting current turn, then compacting.");
+								} else {
+									chatTurnInFlight = false;
+									await runCompact();
+								}
+								return;
+							}
+							if (control === "clear") {
+								const runClear = async () => {
+									// Cut only between turns: mid-turn this could orphan a toolResult
+									// whose toolUse got filtered out, which some providers reject.
+									contextClearedAt = Date.now();
+									persistChatState(boundAccountId, currentRuntime.thread.threadId);
+									await live?.sendImmediate("Context cleared. Starting fresh — I no longer remember this thread's earlier messages.");
+								};
+								if (agentBusy(ctx)) {
+									pendingControlAction = runClear;
+									ctx.abort();
+									await live?.sendImmediate("Aborting current turn, then clearing context.");
+								} else {
+									chatTurnInFlight = false;
+									await runClear();
+									await tryDispatch(ctx);
+								}
+								return;
+							}
+							if (control === "status") {
+								const status = currentRuntime.getStatus();
+								await live?.sendImmediate(
+									`Model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "?"}\nQueue: ${status.queueLength}${status.hasActiveJob ? " (active)" : ""}`,
+								);
+								return;
+							}
+							if (typeof control === "object" && control.type === "model") {
+								const modelQuery = control.name.toLowerCase();
+								const models = ctx.modelRegistry.getAll();
+								const model = models.find(
+									(m) => m.id.toLowerCase() === modelQuery || `${m.provider.toLowerCase()}/${m.id.toLowerCase()}` === modelQuery,
+								);
+								if (model) {
+									const success = await pi.setModel(model);
+									if (success) {
+										await live?.sendImmediate(`✅ Model changed to \`${model.provider}/${model.id}\``);
+									} else {
+										await live?.sendImmediate(`❌ Failed to change model to \`${model.provider}/${model.id}\` (check API keys)`);
+									}
+								} else {
+									const sample = models
+										.map((m) => m.id)
+										.slice(0, 5)
+										.join(", ");
+									await live?.sendImmediate(`❌ Model not found: \`${control.name}\`\nAvailable models include: ${sample}...`);
+								}
+								return;
+							}
+							await currentRuntime.processInbound(input, checkpoint);
+							await tryDispatch(ctx);
+						});
 					},
 					onCaughtUp: async () => runtime?.armAfterCurrentTail(),
 					onError: async (error) => {
@@ -369,6 +377,12 @@ export default function (pi: ExtensionAPI) {
 				},
 				runtime.getLastCheckpoint().cursor,
 			);
+			// The live connection buffers catch-up and gateway messages until this
+			// point, so dispatched turns always have a send-capable connection and
+			// the bridge system prompt is installed before pi can start them.
+			boundAccountId = accountId;
+			threadSystemPromptSuffix = buildThreadSystemPrompt(thread);
+			await live.activate();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (runtime) await runtime.disconnect().catch(() => undefined);
@@ -377,8 +391,6 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Connect error: ${message}`, "error");
 			return false;
 		}
-		boundAccountId = accountId;
-		threadSystemPromptSuffix = buildThreadSystemPrompt(thread);
 		// Carry the /clear watermark across reconnects, so a dropped gateway
 		// connection does not resurrect history the user already cleared.
 		contextClearedAt = getPersistedChatState(ctx)?.contextClearedAt ?? contextClearedAt;
@@ -529,12 +541,33 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		const summary = lastAgentSummary ?? {};
+		let unsolicitedSendError: string | undefined;
 		lastAgentSummary = undefined;
 		if (live) await live.clearToolStatus().catch(() => undefined);
 		if (!runtime || !chatTurnInFlight) {
 			stopTypingLoop();
+			// An async tool/subagent can cause pi to run a later, independent turn
+			// after the Discord-triggered job has already settled. Do not discard its
+			// final text just because there is no active inbound job to complete.
+			if (
+				runtime &&
+				live &&
+				summary.text &&
+				summary.stopReason !== "aborted" &&
+				summary.stopReason !== "error" &&
+				summary.stopReason !== "length"
+			) {
+				try {
+					const remoteMessageId = await live.send(summary.text, [], ctx.signal);
+					await runtime.recordUnsolicitedOutbound(summary.text, remoteMessageId);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					await runtime.appendError(`unsolicited send failed: ${message}`);
+					unsolicitedSendError = message;
+				}
+			}
 			await runPendingControlAction();
-			updateStatus(ctx);
+			updateStatus(ctx, unsolicitedSendError);
 			await tryDispatch(ctx);
 			return;
 		}

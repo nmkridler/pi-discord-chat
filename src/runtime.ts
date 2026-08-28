@@ -17,7 +17,9 @@ import type {
 	DispatchableJob,
 	InboundMessageInput,
 	InboundMessageRecord,
+	JobCompletedRecord,
 	JobQueuedRecord,
+	OutboundMessageRecord,
 	PendingJob,
 	ResolvedThread,
 } from "./types.js";
@@ -40,6 +42,19 @@ function getLatestTriggerRecord(records: ChatLogRecord[], job: PendingJob): Inbo
 	return triggerRecord;
 }
 
+export function isCursorNewer(candidate?: string, current?: string): boolean {
+	if (!candidate) return false;
+	if (!current) return true;
+	if (candidate === current) return false;
+	try {
+		const candidateBig = BigInt(candidate);
+		const currentBig = BigInt(current);
+		return candidateBig > currentBig;
+	} catch {
+		return candidate.localeCompare(current) > 0;
+	}
+}
+
 /**
  * Tracks the message/job queue for a single Discord thread and its on-disk log.
  * Every non-bot message in the thread triggers a turn — once a thread exists,
@@ -54,6 +69,7 @@ export class ConversationRuntime {
 	private pendingJobs: PendingJob[] = [];
 	private activeJob: PendingJob | undefined;
 	private armedAfterRecordId: number | undefined;
+	private ingressQueue: Promise<unknown> = Promise.resolve();
 
 	constructor(thread: ResolvedThread, ownerId: string) {
 		this.thread = thread;
@@ -71,10 +87,48 @@ export class ConversationRuntime {
 		await acquireThreadLock(this.thread, this.ownerId);
 		this.records = await readThreadLog(this.thread);
 		this.nextRecordId = this.records.reduce((max, record) => Math.max(max, record.recordId), 0) + 1;
-		// A brand-new thread (e.g. just spawned from an @mention) has no log yet: arm
-		// immediately so the catch-up fetch that replays its starter message queues a
-		// job for it, instead of waiting for a message after catch-up to trigger a turn.
-		if (this.records.length === 0) this.armAfterCurrentTail();
+
+		// Reconstruct unresolved jobs from the append-only record log
+		const completedJobIds = new Set<string>();
+		const failedJobIds = new Set<string>();
+		const outboundByJobId = new Map<string, OutboundMessageRecord>();
+
+		for (const record of this.records) {
+			if (record.type === "job_completed") completedJobIds.add(record.jobId);
+			else if (record.type === "job_failed") failedJobIds.add(record.jobId);
+			else if (record.type === "outbound" && record.jobId) outboundByJobId.set(record.jobId, record);
+		}
+
+		const queuedRecords = this.records.filter((r): r is JobQueuedRecord => r.type === "job_queued");
+		this.pendingJobs = [];
+
+		for (const queued of queuedRecords) {
+			if (completedJobIds.has(queued.jobId) || failedJobIds.has(queued.jobId)) {
+				continue;
+			}
+			const outbound = outboundByJobId.get(queued.jobId);
+			if (outbound) {
+				// The outbound reply was sent to Discord and persisted to log,
+				// but the process crashed before appending job_completed. Heal the log.
+				const completedRecord: JobCompletedRecord = {
+					type: "job_completed",
+					...buildBaseRecordFields(this.nextRecordId),
+					jobId: queued.jobId,
+					triggerRecordId: queued.triggerRecordId,
+					outboundRecordId: outbound.recordId,
+				};
+				await this.appendRecord(completedRecord);
+				completedJobIds.add(queued.jobId);
+				continue;
+			}
+			this.pendingJobs.push({
+				jobId: queued.jobId,
+				triggerRecordId: queued.triggerRecordId,
+				queuedRecordId: queued.recordId,
+			});
+		}
+
+		this.armedAfterRecordId = this.records.at(-1)?.recordId ?? 0;
 	}
 
 	/**
@@ -99,6 +153,32 @@ export class ConversationRuntime {
 		this.records.push(record);
 		this.nextRecordId = Math.max(this.nextRecordId, record.recordId + 1);
 		await appendThreadRecord(this.thread, record);
+	}
+
+	private hasJobForTrigger(triggerRecordId: number): boolean {
+		return this.records.some(
+			(record) =>
+				(record.type === "job_queued" || record.type === "job_completed" || record.type === "job_failed") &&
+				record.triggerRecordId === triggerRecordId,
+		);
+	}
+
+	private async queueTrigger(record: InboundMessageRecord, recovery = false): Promise<boolean> {
+		if (!this.isAllowedInput(record) || (!recovery && !this.shouldQueueTrigger(record.recordId)) || this.hasJobForTrigger(record.recordId))
+			return false;
+		const queuedRecord: JobQueuedRecord = {
+			type: "job_queued",
+			...buildBaseRecordFields(this.nextRecordId),
+			jobId: randomUUID(),
+			triggerRecordId: record.recordId,
+		};
+		await this.appendRecord(queuedRecord);
+		this.pendingJobs.push({
+			jobId: queuedRecord.jobId,
+			triggerRecordId: queuedRecord.triggerRecordId,
+			queuedRecordId: queuedRecord.recordId,
+		});
+		return true;
 	}
 
 	/**
@@ -159,16 +239,21 @@ export class ConversationRuntime {
 	}
 
 	getLastCheckpoint(): { cursor?: string } {
-		for (let index = this.records.length - 1; index >= 0; index--) {
-			const record = this.records[index];
-			if (record?.type === "checkpoint") return { cursor: record.cursor };
+		let maxCursor: string | undefined;
+		for (const record of this.records) {
+			if (record.type === "checkpoint" && record.cursor) {
+				if (isCursorNewer(record.cursor, maxCursor)) {
+					maxCursor = record.cursor;
+				}
+			}
 		}
-		return {};
+		return { cursor: maxCursor };
 	}
 
 	async noteCheckpoint(checkpoint: { cursor?: string }): Promise<void> {
-		const previous = this.getLastCheckpoint();
-		if (previous.cursor === checkpoint.cursor) return;
+		if (!checkpoint.cursor) return;
+		const current = this.getLastCheckpoint();
+		if (!isCursorNewer(checkpoint.cursor, current.cursor)) return;
 		await this.appendRecord({
 			type: "checkpoint",
 			...buildBaseRecordFields(this.nextRecordId),
@@ -176,12 +261,37 @@ export class ConversationRuntime {
 		});
 	}
 
-	async ingestInbound(
+	/**
+	 * Enqueue an ingress operation into this thread's serialized ingress pipeline.
+	 * Ensures messages, attachments, controls, and checkpoints execute in strict arrival order.
+	 */
+	enqueueIngress<T>(task: () => Promise<T>): Promise<T> {
+		const result = this.ingressQueue.then(task, task);
+		this.ingressQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	async processInbound(
 		input: InboundMessageInput,
 		checkpoint?: { cursor?: string },
 	): Promise<{ record: InboundMessageRecord; jobQueued: boolean }> {
 		const normalized = normalizeInboundMessage(input);
 		const messageId = normalized.messageId || nextMessageId();
+		const existing = this.records.find(
+			(record): record is InboundMessageRecord => record.type === "inbound" && record.messageId === messageId,
+		);
+		if (existing) {
+			// If a crash happened after writing an inbound record but before its queue
+			// record, Discord re-delivers it because the checkpoint was not advanced.
+			// Claim that replay as the missing queue transition before checkpointing it.
+			const checkpointWasNew = checkpoint?.cursor && isCursorNewer(checkpoint.cursor, this.getLastCheckpoint().cursor);
+			const jobQueued = checkpointWasNew ? await this.queueTrigger(existing, true) : false;
+			if (checkpoint) await this.noteCheckpoint(checkpoint);
+			return { record: existing, jobQueued };
+		}
 		const attachments = await materializeAttachments(this.thread, messageId, normalized.attachments);
 		const record: InboundMessageRecord = {
 			type: "inbound",
@@ -195,21 +305,18 @@ export class ConversationRuntime {
 			attachments,
 		};
 		await this.appendRecord(record);
+		const jobQueued = await this.queueTrigger(record);
+		// Advance the remote cursor only after a trigger has either been queued or
+		// intentionally ignored. This keeps an interrupted queue transition replayable.
 		if (checkpoint) await this.noteCheckpoint(checkpoint);
-		if (!this.isAllowedInput(record) || !this.shouldQueueTrigger(record.recordId)) return { record, jobQueued: false };
-		const queuedRecord: JobQueuedRecord = {
-			type: "job_queued",
-			...buildBaseRecordFields(this.nextRecordId),
-			jobId: randomUUID(),
-			triggerRecordId: record.recordId,
-		};
-		await this.appendRecord(queuedRecord);
-		this.pendingJobs.push({
-			jobId: queuedRecord.jobId,
-			triggerRecordId: queuedRecord.triggerRecordId,
-			queuedRecordId: queuedRecord.recordId,
-		});
-		return { record, jobQueued: true };
+		return { record, jobQueued };
+	}
+
+	async ingestInbound(
+		input: InboundMessageInput,
+		checkpoint?: { cursor?: string },
+	): Promise<{ record: InboundMessageRecord; jobQueued: boolean }> {
+		return this.enqueueIngress(() => this.processInbound(input, checkpoint));
 	}
 
 	beginNextJob(): DispatchableJob | undefined {
@@ -262,6 +369,22 @@ export class ConversationRuntime {
 			outboundRecordId,
 		});
 		this.activeJob = undefined;
+	}
+
+	/**
+	 * Records a reply produced by pi outside an inbound Discord job, such as an
+	 * async subagent completion. These replies still belong in the thread log,
+	 * but must not be associated with (or resolve) a queued inbound job.
+	 */
+	async recordUnsolicitedOutbound(text: string, remoteMessageId?: string): Promise<void> {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		await this.appendRecord({
+			type: "outbound",
+			...buildBaseRecordFields(this.nextRecordId),
+			messageId: remoteMessageId || nextMessageId(),
+			text: trimmed,
+		});
 	}
 
 	async failActiveJob(error: string): Promise<void> {

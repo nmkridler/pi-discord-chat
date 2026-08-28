@@ -87,7 +87,8 @@ export interface OutboundMessageRecord extends ChatRecordBase {
 	messageId: string;
 	text: string;
 	replyToMessageId?: string;
-	jobId: string;
+	/** Present when this reply completes an inbound Discord-triggered job. */
+	jobId?: string;
 	attachments?: string[];
 }
 export interface CheckpointRecord extends ChatRecordBase {
@@ -155,6 +156,8 @@ export interface LiveConnectionHandlers {
 
 export interface LiveConnection {
 	thread: ResolvedThread;
+	/** Begin delivering messages buffered while the Discord connection was catching up. */
+	activate(): Promise<void>;
 	disconnect(): Promise<void>;
 	sendImmediate(text: string, replyToMessageId?: string): Promise<string | undefined>;
 	send(text: string, attachmentPaths?: string[], signal?: AbortSignal, replyToMessageId?: string): Promise<string | undefined>;

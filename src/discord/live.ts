@@ -189,7 +189,7 @@ async function sendThreadMessage(
 	return firstMessageId || "";
 }
 
-async function catchUp(client: Client<true>, thread: ResolvedThread, handlers: LiveConnectionHandlers, afterId?: string): Promise<void> {
+async function catchUp(client: Client<true>, thread: ResolvedThread, afterId?: string): Promise<Message[]> {
 	const channel = await resolveThreadChannel(client, thread);
 	const allMessages: Message[] = [];
 	let cursor = afterId;
@@ -201,11 +201,7 @@ async function catchUp(client: Client<true>, thread: ResolvedThread, handlers: L
 		cursor = sorted[sorted.length - 1].id;
 		if (batch.size < 100) break;
 	}
-	for (const message of allMessages) {
-		const input = await messageToInput(thread, message);
-		if (!input) continue;
-		await handlers.onMessage(input, { cursor: input.messageId });
-	}
+	return allMessages;
 }
 
 export async function connectWorkerLive(
@@ -215,22 +211,6 @@ export async function connectWorkerLive(
 ): Promise<LiveConnection> {
 	const botToken = thread.account.botToken;
 	const client = await withReadyClient(botToken);
-	await catchUp(client, thread, handlers, lastCursor);
-	await handlers.onCaughtUp();
-
-	const guildId = await resolveGuildId(client, thread);
-	if (guildId) {
-		try {
-			await registerGuildCommands(botToken, thread.account.botUserId, guildId);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			await sendThreadMessage(
-				botToken,
-				thread.threadId,
-				`⚠️ Could not register Discord slash commands (${message}). This usually means the bot was invited without the \`applications.commands\` OAuth scope — re-invite it with that scope added. Plain-text controls (\`model <name>\`, \`compact\`, \`new\`, \`stop\`, \`status\`) still work.`,
-			).catch(() => undefined);
-		}
-	}
 
 	let statusMessageId: string | undefined;
 	let statusChain: Promise<void> = Promise.resolve();
@@ -238,16 +218,34 @@ export async function connectWorkerLive(
 		statusChain = statusChain.then(op).catch(() => undefined);
 		return statusChain;
 	};
-
-	const onMessageCreate = async (message: Message) => {
+	const pendingDeliveries = new Map<string, () => Promise<void>>();
+	let activated = false;
+	let deliveryChain: Promise<void> = Promise.resolve();
+	const reportDeliveryError = async (error: unknown) => handlers.onError(error instanceof Error ? error : new Error(String(error)));
+	const enqueueDelivery = (id: string, delivery: () => Promise<void>): void => {
+		if (!activated) {
+			pendingDeliveries.set(id, delivery);
+			return;
+		}
+		deliveryChain = deliveryChain.then(delivery).catch(reportDeliveryError);
+	};
+	const compareDeliveryIds = (left: string, right: string): number => {
 		try {
+			const difference = BigInt(left) - BigInt(right);
+			return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+		} catch {
+			return left.localeCompare(right);
+		}
+	};
+
+	const queueMessage = (message: Message) => {
+		enqueueDelivery(message.id, async () => {
 			const input = await messageToInput(thread, message);
 			if (!input) return;
 			await handlers.onMessage(input, { cursor: input.messageId });
-		} catch (error) {
-			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
-		}
+		});
 	};
+	const onMessageCreate = (message: Message) => queueMessage(message);
 	client.on(Events.MessageCreate, onMessageCreate);
 
 	const onInteractionCreate = async (interaction: Interaction) => {
@@ -277,13 +275,27 @@ export async function connectWorkerLive(
 			text,
 			isBot: false,
 		};
-		try {
+		enqueueDelivery(interaction.id, async () => {
 			await handlers.onMessage(input);
-		} catch (error) {
-			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
-		}
+		});
 	};
 	client.on(Events.InteractionCreate, onInteractionCreate);
+
+	for (const message of await catchUp(client, thread, lastCursor)) queueMessage(message);
+
+	const guildId = await resolveGuildId(client, thread);
+	if (guildId) {
+		try {
+			await registerGuildCommands(botToken, thread.account.botUserId, guildId);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendThreadMessage(
+				botToken,
+				thread.threadId,
+				`⚠️ Could not register Discord slash commands (${message}). This usually means the bot was invited without the \`applications.commands\` OAuth scope — re-invite it with that scope added. Plain-text controls (\`model <name>\`, \`compact\`, \`new\`, \`stop\`, \`status\`) still work.`,
+			).catch(() => undefined);
+		}
+	}
 
 	let disconnectFired = false;
 	const fireDisconnect = () => {
@@ -302,6 +314,16 @@ export async function connectWorkerLive(
 
 	return {
 		thread,
+		activate: async () => {
+			if (activated) return deliveryChain;
+			activated = true;
+			for (const [id, delivery] of [...pendingDeliveries].sort(([left], [right]) => compareDeliveryIds(left, right))) {
+				pendingDeliveries.delete(id);
+				enqueueDelivery(id, delivery);
+			}
+			await deliveryChain;
+			await handlers.onCaughtUp();
+		},
 		disconnect: async () => {
 			client.off(Events.MessageCreate, onMessageCreate);
 			client.off(Events.InteractionCreate, onInteractionCreate);

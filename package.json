@@ -21,8 +21,9 @@
 		"discord.js": "^14.26.3"
 	},
 	"scripts": {
-		"check": "biome check . && tsc --noEmit",
-		"format": "biome check --write ."
+		"check": "biome check . && tsc --noEmit && npm test",
+		"format": "biome check --write .",
+		"test": "node --import tsx --test test/**/*.test.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
@@ -34,6 +35,7 @@
 		"@earendil-works/pi-coding-agent": "^0.80.10",
 		"@earendil-works/pi-tui": "^0.80.10",
 		"@types/node": "^24.5.2",
+		"tsx": "^4.23.12",
 		"typebox": "^1.1.38",
 		"typescript": "^5.9.2"
 	}

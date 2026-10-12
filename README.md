@@ -119,7 +119,7 @@ commands as that user.
   archived/locked) can post.
 - `chat_attach` is restricted to files inside the thread's working directory, so a compromised turn can't
   exfiltrate arbitrary host files as a Discord attachment — but reads/writes/bash are not similarly restricted.
-- `write`/`edit`/`bash` are blocked from touching anything under `~/.pi` (pi's own config, sessions, and
-  credentials), so a chat turn can't rewrite the default model/provider or other global settings as a side
-  effect of a natural-language request — use `/model`, `/compact`, `/clear`, `/stop` for those instead.
+- `~/.pi` (pi's own config, sessions, and credentials) is **not** shielded from `write`/`edit`/`bash` — a chat
+  turn can modify global pi settings. Rely on `access.allowedUserIds` / `allowedRoleIds` and on the
+  pi-permission-system gates, and prefer `/model`, `/compact`, `/clear`, `/stop` for configuration changes.
 - `config.json` contains a live bot token in plaintext; treat it like any other credential file.

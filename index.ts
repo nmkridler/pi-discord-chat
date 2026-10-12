@@ -1,8 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { basename, relative, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -17,7 +15,6 @@ import type { ChatConfig, LiveConnection, ResolvedThread } from "./src/types.js"
 
 const CHAT_CONNECT_FLAG = "chat-connect";
 const SESSION_STATE_CUSTOM_TYPE = "pi-discord-chat-state";
-const PI_HOME_DIR = resolvePath(homedir(), ".pi");
 /**
  * How long to wait for `agent_start` after dispatching a turn before assuming
  * pi never started it. `pi.sendUserMessage` is fire-and-forget — a rejected
@@ -481,28 +478,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	function pathTouchesPiHome(path: string): boolean {
-		const rel = relative(PI_HOME_DIR, resolvePath(path));
-		return rel === "" || !rel.startsWith("..");
-	}
-
-	function commandTouchesPiHome(command: string): boolean {
-		return command.includes(PI_HOME_DIR) || /(~|\$HOME)\/\.pi(\/|$)/.test(command);
-	}
-
-	const PI_HOME_BLOCK_REASON =
-		"Refusing to touch pi's own configuration under ~/.pi — tell the user to use /model, /compact, /new, or /stop instead.";
-
 	pi.on("tool_call", async (event) => {
-		if (isToolCallEventType("write", event) && pathTouchesPiHome(event.input.path)) {
-			return { block: true, reason: PI_HOME_BLOCK_REASON };
-		}
-		if (isToolCallEventType("edit", event) && pathTouchesPiHome(event.input.path)) {
-			return { block: true, reason: PI_HOME_BLOCK_REASON };
-		}
-		if (isToolCallEventType("bash", event) && commandTouchesPiHome(event.input.command)) {
-			return { block: true, reason: PI_HOME_BLOCK_REASON };
-		}
 		if (!chatTurnInFlight || !live) return;
 		void live.setToolStatus(summarizeToolCall(event.toolName, event.input as Record<string, unknown>));
 	});
